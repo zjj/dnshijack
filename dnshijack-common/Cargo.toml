@@ -1,0 +1,13 @@
+[package]
+name = "dnshijack-common"
+version = "0.1.0"
+edition = "2021"
+
+# When built as part of the eBPF crate, no_std is required.
+# The "user" feature enables the aya::Pod impl for userspace use.
+[features]
+default = []
+user = ["aya"]
+
+[dependencies]
+aya = { version = "0.13", optional = true }

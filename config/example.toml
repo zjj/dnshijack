@@ -1,0 +1,55 @@
+# dnshijack — example configuration
+#
+# Each [[records]] entry defines a forced DNS answer.
+# When a client queries the listed qname+qtype the eBPF program responds
+# directly without forwarding to unbound/bind.
+#
+# Supported qtypes: A, AAAA, CNAME, MX, NS, PTR, TXT (or raw numbers).
+
+# ── A records (IPv4) ──────────────────────────────────────────────────────────
+[[records]]
+qname   = "example.internal"
+qtype   = "A"
+ttl     = 300
+answers = ["192.168.1.10"]
+
+[[records]]
+qname   = "multi.internal"
+qtype   = "A"
+ttl     = 60
+answers = ["10.0.0.1", "10.0.0.2", "10.0.0.3"]
+
+# ── AAAA records (IPv6) ───────────────────────────────────────────────────────
+[[records]]
+qname   = "example.internal"
+qtype   = "AAAA"
+ttl     = 300
+answers = ["fd00::1"]
+
+# ── CNAME record ─────────────────────────────────────────────────────────────
+[[records]]
+qname   = "www.internal"
+qtype   = "CNAME"
+ttl     = 300
+answers = ["example.internal"]
+
+# ── MX record ─────────────────────────────────────────────────────────────────
+[[records]]
+qname   = "internal"
+qtype   = "MX"
+ttl     = 3600
+answers = ["10 mail.internal"]
+
+# ── TXT record ────────────────────────────────────────────────────────────────
+[[records]]
+qname   = "internal"
+qtype   = "TXT"
+ttl     = 3600
+answers = ["v=spf1 mx -all"]
+
+
+[[records]]
+qname   = "www.baidu.com"
+qtype   = "A"
+ttl     = 300
+answers = ["192.168.1.10"]
