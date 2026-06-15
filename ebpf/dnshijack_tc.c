@@ -165,7 +165,7 @@ int dnshijack_tc(struct __sk_buff *skb)
     if (!val)
         return TC_ACT_OK;
 
-    __u16 payload_len = val->payload_len;
+    __u32 payload_len = val->payload_len;
     if (payload_len == 0 || payload_len > DNS_PAYLOAD_MAX)
         return TC_ACT_OK;
 
@@ -261,9 +261,36 @@ int dnshijack_tc(struct __sk_buff *skb)
         return TC_ACT_OK;
 
     // Copy pre-computed payload (after txid).
-    if (bpf_skb_store_bytes(skb, dns_off + 2,
-                            val->payload, payload_len, 0) != 0)
-        return TC_ACT_OK;
+    // Older verifiers are sensitive to variable map-value indexing. Keep map
+    // accesses at compile-time-constant offsets by handling each 32-byte block
+    // with constant indices only.
+    #pragma unroll
+    for (int c = 0; c < (DNS_PAYLOAD_MAX / 32); c++) {
+        const __u32 off = (__u32)c * 32;
+        if (payload_len <= off)
+            continue;
+
+        if (payload_len >= off + 32) {
+            __u8 chunk_buf[32];
+            __builtin_memcpy(chunk_buf, val->payload + off, sizeof(chunk_buf));
+            if (bpf_skb_store_bytes(skb, dns_off + 2 + off,
+                                    chunk_buf, sizeof(chunk_buf), 0) != 0)
+                return TC_ACT_OK;
+            continue;
+        }
+
+        // Tail bytes in the final partial block: write one byte at a time.
+        #pragma unroll
+        for (int t = 0; t < 32; t++) {
+            const __u32 idx = off + (__u32)t;
+            if (payload_len <= idx)
+                break;
+
+            __u8 b = val->payload[idx];
+            if (bpf_skb_store_bytes(skb, dns_off + 2 + idx, &b, 1, 0) != 0)
+                return TC_ACT_OK;
+        }
+    }
 
     // ── Redirect back to the ingress interface (sends the response) ──────────
     return bpf_redirect(skb->ingress_ifindex, 0);

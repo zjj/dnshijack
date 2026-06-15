@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use anyhow::{bail, Context, Result};
 use aya::{
     maps::HashMap,
-    programs::{SchedClassifier, TcAttachType},
+    programs::{tc, SchedClassifier, TcAttachType},
     Ebpf, EbpfLoader,
 };
 use aya_obj::Object;
@@ -126,6 +126,15 @@ async fn main() -> Result<()> {
         .try_into()
         .context("program is not a SchedClassifier")?;
     program.load().context("loading TC program")?;
+
+    // Older kernels often require explicitly creating clsact before attach.
+    match tc::qdisc_add_clsact(&cli.iface) {
+        Ok(()) => info!("Added clsact qdisc on '{}'.", cli.iface),
+        Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
+            info!("clsact qdisc already exists on '{}'.", cli.iface)
+        }
+        Err(e) => return Err(anyhow::Error::new(e).context("adding clsact qdisc")),
+    }
 
     let _link = program
         .attach(&cli.iface, TcAttachType::Ingress)
