@@ -1,11 +1,11 @@
-//! dnshijack — DNS forced-resolution via eBPF TC.
+//! dnshijack — DNS forced-resolution via eBPF XDP.
 //!
 //! Usage:
 //!   sudo dnshijack --iface eth0 --config /etc/dnshijack/config.toml
 //!
 //! On startup the program:
-//!   1. Loads the eBPF TC classifier (compiled into this binary).
-//!   2. Attaches it to TC ingress of the specified interface.
+//!   1. Loads the eBPF XDP program (compiled into this binary).
+//!   2. Attaches it to XDP on the specified interface.
 //!   3. Reads the config file, encodes every record into BPF map entries.
 //!   4. Waits for SIGHUP (config reload) or SIGINT/SIGTERM (shutdown).
 
@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use anyhow::{bail, Context, Result};
 use aya::{
     maps::HashMap,
-    programs::{tc, SchedClassifier, TcAttachType},
+    programs::{Xdp, XdpFlags},
     Ebpf, EbpfLoader,
 };
 use aya_obj::Object;
@@ -40,7 +40,7 @@ const BUILD_OUT_DIR: &str = env!("OUT_DIR");
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 #[derive(Parser, Debug)]
-#[command(author, version, about = "DNS forced-resolution via eBPF TC")]
+#[command(author, version, about = "DNS forced-resolution via eBPF XDP")]
 struct Cli {
     /// Network interface to attach to (e.g. eth0)
     #[arg(short, long)]
@@ -124,27 +124,18 @@ async fn main() -> Result<()> {
         warn!("EbpfLogger init failed (non-fatal): {e}");
     }
 
-    let program: &mut SchedClassifier = bpf
-        .program_mut("dnshijack_tc")
-        .ok_or_else(|| anyhow::anyhow!("program 'dnshijack_tc' not found in ELF"))?
+    let program: &mut Xdp = bpf
+        .program_mut("dnshijack_xdp")
+        .ok_or_else(|| anyhow::anyhow!("program 'dnshijack_xdp' not found in ELF"))?
         .try_into()
-        .context("program is not a SchedClassifier")?;
-    program.load().context("loading TC program")?;
-
-    // Older kernels often require explicitly creating clsact before attach.
-    match tc::qdisc_add_clsact(&cli.iface) {
-        Ok(()) => info!("Added clsact qdisc on '{}'.", cli.iface),
-        Err(e) if e.raw_os_error() == Some(libc::EEXIST) => {
-            info!("clsact qdisc already exists on '{}'.", cli.iface)
-        }
-        Err(e) => return Err(anyhow::Error::new(e).context("adding clsact qdisc")),
-    }
+        .context("program is not an Xdp program")?;
+    program.load().context("loading XDP program")?;
 
     let _link = program
-        .attach(&cli.iface, TcAttachType::Ingress)
-        .context("attaching TC ingress hook")?;
+        .attach(&cli.iface, XdpFlags::SKB_MODE)
+        .context("attaching XDP hook (SKB mode)")?;
     info!(
-        "TC ingress hook attached to '{}'. Listening for DNS queries.",
+        "XDP hook attached to '{}'. Listening for DNS queries.",
         cli.iface
     );
 
@@ -176,9 +167,9 @@ async fn main() -> Result<()> {
         }
     }
 
-    // The _link guard detaches the TC program when it is dropped.
+    // The _link guard detaches the XDP program when it is dropped.
     drop(_link);
-    info!("TC hook removed. Bye.");
+    info!("XDP hook removed. Bye.");
     Ok(())
 }
 

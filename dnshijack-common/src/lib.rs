@@ -21,7 +21,7 @@ pub const DNS_PAYLOAD_MAX: usize = 768;
 /// The name is stored as-is from the DNS wire format:
 ///   `\x07example\x03com\x00`
 /// All ASCII letters are lowercased before insertion / lookup.
-#[repr(C)]
+#[repr(C, align(8))]
 #[derive(Copy, Clone)]
 pub struct DnsKey {
     /// Wire-format qname, zero-padded to QNAME_MAX_LEN bytes.
@@ -55,7 +55,7 @@ impl DnsKey {
 ///
 /// The eBPF program patches in the original Transaction ID at DNS offset 0
 /// and copies this payload starting at DNS offset 2.
-#[repr(C)]
+#[repr(C, align(8))]
 #[derive(Copy, Clone)]
 pub struct DnsValue {
     /// Pre-encoded DNS response bytes (everything after the 2-byte txid).

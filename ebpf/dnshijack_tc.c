@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 //
-// dnshijack_tc.c — eBPF TC ingress classifier
+// dnshijack_tc.c — eBPF XDP program
 //
 // Intercepts DNS queries (UDP/53).  For each (qname, qtype) pair found in
 // the DNS_CACHE map, builds a DNS response in-place and redirects the packet
@@ -15,7 +15,7 @@
 // The userspace loader embeds dnshijack_tc.o and uses aya to load/attach it.
 
 #include <linux/bpf.h>
-#include <linux/pkt_cls.h>
+#include <linux/if_link.h>
 #include <linux/if_ether.h>
 #include <linux/ip.h>
 #include <linux/in.h>
@@ -74,71 +74,80 @@ csum_update(__u16 old_csum, __u16 old_val, __u16 new_val)
     return ~csum;
 }
 
-// ── TC classifier ────────────────────────────────────────────────────────────
+// ── XDP program ──────────────────────────────────────────────────────────────
 
-SEC("classifier/ingress")
-int dnshijack_tc(struct __sk_buff *skb)
+SEC("xdp")
+int dnshijack_xdp(struct xdp_md *ctx)
 {
-    void *data     = (void *)(long)skb->data;
-    void *data_end = (void *)(long)skb->data_end;
+    void *data     = (void *)(long)ctx->data;
+    void *data_end = (void *)(long)ctx->data_end;
+    __u32 old_pkt_len = (__u32)((__u8 *)data_end - (__u8 *)data);
 
     // ── Ethernet ─────────────────────────────────────────────────────────────
     struct ethhdr *eth = data;
     if ((void *)(eth + 1) > data_end)
-        return TC_ACT_OK;
+        return XDP_PASS;
     if (eth->h_proto != bpf_htons(ETH_P_IP))
-        return TC_ACT_OK;
+        return XDP_PASS;
 
     // ── IPv4 (standard 20-byte header) ───────────────────────────────────────
     struct iphdr *ip = (void *)(eth + 1);
     if ((void *)(ip + 1) > data_end)
-        return TC_ACT_OK;
+        return XDP_PASS;
     if (ip->ihl != 5)           // no IP options
-        return TC_ACT_OK;
+        return XDP_PASS;
     if (ip->protocol != IPPROTO_UDP)
-        return TC_ACT_OK;
+        return XDP_PASS;
 
     // ── UDP ──────────────────────────────────────────────────────────────────
     struct udphdr *udp = (void *)(ip + 1);
     if ((void *)(udp + 1) > data_end)
-        return TC_ACT_OK;
+        return XDP_PASS;
     if (udp->dest != bpf_htons(DNS_PORT))
-        return TC_ACT_OK;
+        return XDP_PASS;
 
     // ── DNS header ───────────────────────────────────────────────────────────
     __u8 *dns = (void *)(udp + 1);
     if (dns + 12 > (__u8 *)data_end)
-        return TC_ACT_OK;
+        return XDP_PASS;
+
+    __u16 udp_len = bpf_ntohs(udp->len);
+    if (udp_len < sizeof(struct udphdr) + 12)
+        return XDP_PASS;
+
+    __u16 dns_payload_len = udp_len - sizeof(struct udphdr);
 
     // Byte 2-3: flags.  QR bit (bit 15) must be 0 (query).
     __u16 dns_flags = ((__u16)dns[2] << 8) | dns[3];
     if (dns_flags & 0x8000)
-        return TC_ACT_OK;   // already a response
+        return XDP_PASS;   // already a response
 
     // Byte 4-5: QDCOUNT must be 1
     __u16 qdcount = ((__u16)dns[4] << 8) | dns[5];
     if (qdcount != 1)
-        return TC_ACT_OK;
+        return XDP_PASS;
 
     // ── Parse qname ──────────────────────────────────────────────────────────
     struct dns_key key = {};
-    __u8 *p = dns + 12;         // start of question section
+    __u16 dns_rem = dns_payload_len - 12;
     int   key_pos = 0;
     int   name_done = 0;
-
-    // Walk the wire-format name.  Unrolled enough for verifier termination.
-    // Max 256 iterations covers the worst-case name length.
     int label_rem = 0;
+    __u8 *p = dns + 12;         // start of question section
 
-    #pragma unroll
+    // Parse qname from linear XDP packet bytes.
     for (int i = 0; i < QNAME_MAX_LEN; i++) {
+        if (dns_rem == 0)
+            return XDP_PASS;
         if (p + 1 > (__u8 *)data_end)
-            return TC_ACT_OK;
+            return XDP_PASS;
+
         __u8 b = *p++;
+        dns_rem--;
 
         if (label_rem == 0) {
             if (b > 63)             // compression pointer — unexpected in query
-                return TC_ACT_OK;
+                return XDP_PASS;
             if (key_pos < QNAME_MAX_LEN)
                 key.qname[key_pos++] = b;
             if (b == 0) { name_done = 1; break; }
@@ -152,22 +161,24 @@ int dnshijack_tc(struct __sk_buff *skb)
     }
 
     if (!name_done)
-        return TC_ACT_OK;
+        return XDP_PASS;
 
     // p now points to qtype (2 bytes) + qclass (2 bytes)
+    if (dns_rem < 4)
+        return XDP_PASS;
     if (p + 4 > (__u8 *)data_end)
-        return TC_ACT_OK;
+        return XDP_PASS;
     __u16 qtype = ((__u16)p[0] << 8) | p[1];
     key.qtype = qtype;
 
     // ── Map lookup ───────────────────────────────────────────────────────────
     struct dns_value *val = bpf_map_lookup_elem(&DNS_CACHE, &key);
     if (!val)
-        return TC_ACT_OK;
+        return XDP_PASS;
 
     __u32 payload_len = val->payload_len;
     if (payload_len == 0 || payload_len > DNS_PAYLOAD_MAX)
-        return TC_ACT_OK;
+        return XDP_PASS;
 
     // ── Craft response ───────────────────────────────────────────────────────
     // Transaction ID (first 2 DNS bytes)
@@ -179,61 +190,36 @@ int dnshijack_tc(struct __sk_buff *skb)
     __u32 new_ip_total = sizeof(struct iphdr)  + new_udp_len;
     __u32 new_pkt_len  = sizeof(struct ethhdr) + new_ip_total;
 
-    // Resize skb (extend or truncate)
-    if (bpf_skb_change_tail(skb, new_pkt_len, 0) != 0)
-        return TC_ACT_OK;
+    // Resize packet (extend or truncate)
+    int delta = (int)new_pkt_len - (int)old_pkt_len;
+    if (bpf_xdp_adjust_tail(ctx, delta) != 0)
+        return XDP_PASS;
 
-    // Reload pointers after resize
-    data     = (void *)(long)skb->data;
-    data_end = (void *)(long)skb->data_end;
+    // Reload pointers after resize/adjust
+    data     = (void *)(long)ctx->data;
+    data_end = (void *)(long)ctx->data_end;
     eth = data;
     ip  = (void *)(eth + 1);
     udp = (void *)(ip  + 1);
     dns = (void *)(udp + 1);
 
-    // Re-validate all header boundaries after skb resize so the verifier can
+    // Re-validate all header boundaries after adjust so the verifier can
     // prove subsequent direct packet accesses are in-bounds.
     if ((void *)(eth + 1) > data_end)
-        return TC_ACT_OK;
+        return XDP_PASS;
     if ((void *)(ip + 1) > data_end)
-        return TC_ACT_OK;
+        return XDP_PASS;
     if ((void *)(udp + 1) > data_end)
-        return TC_ACT_OK;
+        return XDP_PASS;
 
     if ((void *)dns + new_dns_len > data_end)
-        return TC_ACT_OK;
+        return XDP_PASS;
 
     // ── Swap Ethernet MACs ───────────────────────────────────────────────────
-    // Use skb byte helpers (instead of direct packet memcpy) for verifier-safe
-    // reads/writes after tail adjustment.
-    __u8 old_dst_mac[6];
-    __u8 old_src_mac[6];
-    if (bpf_skb_load_bytes(skb, 0, old_dst_mac, sizeof(old_dst_mac)) != 0)
-        return TC_ACT_OK;
-    if (bpf_skb_load_bytes(skb, 6, old_src_mac, sizeof(old_src_mac)) != 0)
-        return TC_ACT_OK;
-    if (bpf_skb_store_bytes(skb, 0, old_src_mac, sizeof(old_src_mac), 0) != 0)
-        return TC_ACT_OK;
-    if (bpf_skb_store_bytes(skb, 6, old_dst_mac, sizeof(old_dst_mac), 0) != 0)
-        return TC_ACT_OK;
-
-    // Any skb load/store helper can invalidate prior direct packet pointers.
-    // Refresh pointers before touching packet headers directly again.
-    data     = (void *)(long)skb->data;
-    data_end = (void *)(long)skb->data_end;
-    eth = data;
-    ip  = (void *)(eth + 1);
-    udp = (void *)(ip  + 1);
-    dns = (void *)(udp + 1);
-
-    if ((void *)(eth + 1) > data_end)
-        return TC_ACT_OK;
-    if ((void *)(ip + 1) > data_end)
-        return TC_ACT_OK;
-    if ((void *)(udp + 1) > data_end)
-        return TC_ACT_OK;
-    if ((void *)dns + new_dns_len > data_end)
-        return TC_ACT_OK;
+    __u8 tmp_mac[6];
+    __builtin_memcpy(tmp_mac, eth->h_dest, sizeof(tmp_mac));
+    __builtin_memcpy(eth->h_dest, eth->h_source, sizeof(tmp_mac));
+    __builtin_memcpy(eth->h_source, tmp_mac, sizeof(tmp_mac));
 
     // ── Swap IP src/dst; update total length; fix checksum ───────────────────
     __be32 tmp_ip = ip->saddr;
@@ -254,11 +240,16 @@ int dnshijack_tc(struct __sk_buff *skb)
     udp->check  = 0;  // RFC 768: 0 means "not computed"
 
     // ── Write DNS response ───────────────────────────────────────────────────
-    // Use skb helper writes to keep verifier packet bounds reasoning simple.
-    __u32 dns_off = (__u32)((__u8 *)dns - (__u8 *)data);
-    __u8 txid_be[2] = { (__u8)(txid >> 8), (__u8)(txid & 0xff) };
-    if (bpf_skb_store_bytes(skb, dns_off, txid_be, sizeof(txid_be), 0) != 0)
-        return TC_ACT_OK;
+    // Older verifiers need a constant bound proof for the first two DNS bytes.
+    if ((void *)(dns + 2) > data_end)
+        return XDP_PASS;
+
+    dns[0] = (__u8)(txid >> 8);
+    dns[1] = (__u8)(txid & 0xff);
+
+    __u8 *dst = dns + 2;
+    if ((void *)(dst + payload_len) > data_end)
+        return XDP_PASS;
 
     // Copy pre-computed payload (after txid).
     // Older verifiers are sensitive to variable map-value indexing. Keep map
@@ -273,9 +264,9 @@ int dnshijack_tc(struct __sk_buff *skb)
         if (payload_len >= off + 32) {
             __u8 chunk_buf[32];
             __builtin_memcpy(chunk_buf, val->payload + off, sizeof(chunk_buf));
-            if (bpf_skb_store_bytes(skb, dns_off + 2 + off,
-                                    chunk_buf, sizeof(chunk_buf), 0) != 0)
-                return TC_ACT_OK;
+            if ((void *)(dst + off + sizeof(chunk_buf)) > data_end)
+                return XDP_PASS;
+            __builtin_memcpy(dst + off, chunk_buf, sizeof(chunk_buf));
             continue;
         }
 
@@ -286,14 +277,15 @@ int dnshijack_tc(struct __sk_buff *skb)
             if (payload_len <= idx)
                 break;
 
+            if ((void *)(dst + idx + 1) > data_end)
+                return XDP_PASS;
             __u8 b = val->payload[idx];
-            if (bpf_skb_store_bytes(skb, dns_off + 2 + idx, &b, 1, 0) != 0)
-                return TC_ACT_OK;
+            dst[idx] = b;
         }
     }
 
-    // ── Redirect back to the ingress interface (sends the response) ──────────
-    return bpf_redirect(skb->ingress_ifindex, 0);
+    // ── Send the forged response back out the ingress NIC ───────────────────
+    return XDP_TX;
 }
 
 char LICENSE[] SEC("license") = "GPL";
