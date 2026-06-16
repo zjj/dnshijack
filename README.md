@@ -1,14 +1,15 @@
 # dnshijack
 
-An eBPF TC-based DNS forced-resolution daemon.
+An eBPF XDP-based DNS forced-resolution daemon.
 
 For every DNS query whose `(qname, qtype)` is listed in the config file, the
-eBPF program intercepts the packet **in-kernel**, constructs a complete DNS
-response and sends it back to the client—without the packet ever reaching
-unbound/bind.  Queries for unlisted domains pass through unchanged.
+eBPF program intercepts the packet **at the NIC driver level**, constructs a 
+complete DNS response and sends it back to the client—without the packet ever 
+reaching unbound/bind or the kernel network stack.  Queries for unlisted domains 
+pass through unchanged.
 
 ```
-client ──UDP/53──► [NIC ingress TC]
+client ──UDP/53──► [NIC driver XDP]
                         │
               ┌─────────┴──────────┐
               │  DNS_CACHE lookup  │
@@ -17,7 +18,7 @@ client ──UDP/53──► [NIC ingress TC]
                         │
               swap MACs/IPs/ports
               write pre-built response
-              bpf_redirect → client
+              XDP_TX → client
 ```
 
 ---
@@ -26,7 +27,7 @@ client ──UDP/53──► [NIC ingress TC]
 
 | Component | Minimum version |
 |-----------|----------------|
-| Linux kernel | 5.8 (TC ingress redirect path) |
+| Linux kernel | 5.8 (XDP support with SKB fallback mode) |
 | Rust toolchain | stable 1.70+ |
 | clang | any version with `-target bpf` support (clang ≥ 10) |
 | binutils | recommended |
@@ -182,7 +183,7 @@ sudo ./target/release/dnshijack --iface ens3 --config /etc/dnshijack/config.toml
 Expected output:
 ```
 [INFO dnshijack] Loading eBPF program onto interface 'ens3'
-[INFO dnshijack] TC ingress hook attached to 'ens3'. Listening for DNS queries.
+[INFO dnshijack] XDP hook attached to 'ens3' (SKB mode). Listening for DNS queries.
 [INFO dnshijack] Loaded 3/3 record(s) into DNS_CACHE.
 ```
 
@@ -206,13 +207,13 @@ dig @localhost google.com A
 ```
 dnshijack/
 ├── ebpf/
-│   └── dnshijack_tc.c        # BPF TC classifier (C, compiled by build.rs)
+│   └── dnshijack_tc.c        # BPF XDP program (C, compiled by build.rs)
 ├── dnshijack-common/
 │   └── src/lib.rs             # Shared DnsKey / DnsValue structs (no_std)
 └── dnshijack/
     ├── build.rs               # Invokes clang and embeds .o
     └── src/
-        ├── main.rs            # aya loader, TC attach, signal handling
+        ├── main.rs            # aya loader, XDP attach, signal handling
         ├── config.rs          # TOML config parser (serde)
         └── dns.rs             # DNS wire-format encoder / response builder
 ```
@@ -220,14 +221,23 @@ dnshijack/
 **BPF map layout**
 
 ```
-DNS_CACHE  BPF_MAP_TYPE_HASH   max 4096 entries
+DNS_CACHE  BPF_MAP_TYPE_HASH   max 1,048,576 entries
   key   → DnsKey   { qname: [u8; 256], qtype: u16 }
   value → DnsValue { payload: [u8; 768], payload_len: u16 }
 ```
 
 `payload` is the pre-encoded DNS response starting at byte offset 2 (after the
-transaction ID).  The eBPF program patches in the original TxID and redirects
-the packet back via `bpf_redirect(ingress_ifindex, 0)`.
+transaction ID).  The eBPF program patches in the original TxID and returns 
+`XDP_TX` to send the packet back via the NIC driver.
+
+### XDP vs TC: Why XDP?
+
+**XDP (eXpress Data Path)** was chosen over TC (Traffic Control) for:
+
+- **Performance**: Runs at NIC driver level before kernel stack processing → minimal latency
+- **Simplicity**: No qdisc setup required; direct NIC driver attachment
+- **Scalability**: Handles high-frequency DNS queries efficiently
+- **Kernel 5.10 compatibility**: Stable XDP support with SKB fallback mode for maximum compatibility
 
 ---
 
@@ -236,7 +246,8 @@ the packet back via `bpf_redirect(ingress_ifindex, 0)`.
 | Symptom | Likely cause | Fix |
 |---------|--------------|-----|
 | `error parsing ELF data` | Unsupported ELF sections from toolchain | Rebuild with current `build.rs` (legacy `maps` + `-fno-addrsig`) |
-| `program 'dnshijack_tc' not found` | Wrong section name in `.c` | Must be `SEC("classifier/ingress")` |
-| `attaching TC ingress hook` fails | `tc` qdisc not present | kernel auto-adds it with aya; ensure `CAP_NET_ADMIN` |
+| `program 'dnshijack_xdp' not found` | Wrong section name in `.c` | Must be `SEC("xdp")` |
+| `attaching XDP hook` fails | XDP not supported on this NIC driver | Try SKB mode or check driver support |
 | DNS queries not intercepted | Wrong `--iface` | Must be the interface the queries arrive on |
 | Stale answers after config change | Old entries not flushed | Restart daemon for full flush |
+| Long domain names not matched | DNS payload length validation | Ensure config domain length matches qname field (max 256 bytes) |
