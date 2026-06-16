@@ -96,6 +96,10 @@ async fn main() -> Result<()> {
         bail!("dnshijack must be run as root (requires CAP_BPF + CAP_NET_ADMIN)");
     }
 
+    // On older kernels/cgroup setups, BPF map creation is still constrained by
+    // memlock limits. Bump it early to avoid EPERM on large maps.
+    bump_memlock_limit().context("raising RLIMIT_MEMLOCK")?;
+
     info!("Loading eBPF program onto interface '{}'", cli.iface);
 
     // ── Load and attach ───────────────────────────────────────────────────────
@@ -234,4 +238,20 @@ fn load_config_into_map(config_path: &PathBuf, bpf: &mut Ebpf) -> Result<()> {
 fn is_root() -> bool {
     // SAFETY: geteuid() is always safe.
     unsafe { libc::geteuid() == 0 }
+}
+
+/// Increase RLIMIT_MEMLOCK so large BPF maps can be created on older kernels.
+fn bump_memlock_limit() -> Result<()> {
+    let rlim = libc::rlimit {
+        rlim_cur: libc::RLIM_INFINITY,
+        rlim_max: libc::RLIM_INFINITY,
+    };
+    // SAFETY: setrlimit only reads the provided structure.
+    let rc = unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &rlim) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        // Some environments disallow changing limits; continue with warning.
+        warn!("setrlimit(RLIMIT_MEMLOCK) failed: {err}");
+    }
+    Ok(())
 }

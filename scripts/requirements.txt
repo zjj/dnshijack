@@ -1,0 +1,2 @@
+# No external libraries required; uses only Python standard library
+# If you prefer TOML library, you can `pip install toml` and adapt the script.

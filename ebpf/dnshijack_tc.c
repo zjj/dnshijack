@@ -57,8 +57,8 @@ struct bpf_map_def SEC("maps") DNS_CACHE = {
     .type = BPF_MAP_TYPE_HASH,
     .key_size = sizeof(struct dns_key),
     .value_size = sizeof(struct dns_value),
-    .max_entries = 4096,
-    .map_flags = 0,
+    .max_entries = 1024 * 1024,
+    .map_flags = BPF_F_NO_PREALLOC,
 };
 
 // ── Helper: in-place IP checksum update ──────────────────────────────────────
